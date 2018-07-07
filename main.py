@@ -1,4 +1,5 @@
 import abc
+import functools
 import itertools
 import math
 import re
@@ -6,6 +7,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas
+from scipy.optimize import curve_fit
 
 
 # import matplotlib.pyplot as plt
@@ -23,6 +25,9 @@ class Hero(object):
 
     def __str__(self):
         return self.name
+
+    def __lt__(self, other):
+        return 1
 
 
 ANA = Hero("Ana")
@@ -63,6 +68,7 @@ HEROES = [ANA, BASTION, BRIGITTE, DVA, DOOMFIST, GENJI, HANZO, JUNKRAT, LUCIO, M
 BLUE = "Blue"
 RED = "Red"
 TEAMS = [BLUE, RED]
+
 
 # region Report Elements
 class ReportElement(object):
@@ -118,6 +124,51 @@ ESCORT = 4
 MODES = [ASSAULT_ESCORT, ASSAULT, CONTROL, TDM, ESCORT]
 ASSYMETRIC_MODES = [ASSAULT_ESCORT, ASSAULT, ESCORT]
 
+
+# region MAPS
+class Map(object):
+    def __init__(self, name, mode):
+        self.name = name
+        self.mode = mode
+        self.fun = None  # ha
+
+    def __str__(self):
+        return self.name
+
+
+HANAMURA = Map("A_Hanamura", ASSAULT)
+HORIZON = Map("A_HorizonLunarColony", ASSAULT)
+ANUBIS = Map("A_TempleOfAnubis", ASSAULT)
+VOLSKAYA = Map("A_VolskayaIndustries", ASSAULT)
+
+BLIZZARD_WORLD = Map("AE_BlizzardWorld", ASSAULT_ESCORT)
+EICHENWALDE = Map("AE_Eichenwalde", ASSAULT_ESCORT)
+HOLLYWOOD = Map("AE_Hollywood", ASSAULT_ESCORT)
+KINGS_ROW = Map("AE_KingsRow", ASSAULT_ESCORT)
+NUMBANI = Map("AE_Numbani", ASSAULT_ESCORT)
+
+ILIOS = Map("C_Ilios", CONTROL)
+LIJANG = Map("C_Lijiang", CONTROL)
+NEPAL = Map("C_Nepal", CONTROL)
+OASIS = Map("C_Oasis", CONTROL)
+
+BLACK_FOREST = Map("TDM_BlackForest", TDM)
+CASTILLO = Map("TDM_Castillo", TDM)
+CHATEAU = Map("TDM_ChateauGuillard", TDM)
+ANTARCTICA = Map("TDM_Antarctica", TDM)
+NECROPOLIS = Map("TDM_Necropolis", TDM)
+PETRA = Map("TDM_Petra", TDM)
+
+DORADO = Map("E_Dorado", ESCORT)
+JUNKERTOWN = Map("E_Junkertown", ESCORT)
+RIALTO = Map("E_Rialto", ESCORT)
+ROUTE66 = Map("E_Route66", ESCORT)
+GIBRALTAR = Map("E_Gibraltar", ESCORT)
+
+MAPS = [HANAMURA, HORIZON, ANUBIS, VOLSKAYA, BLIZZARD_WORLD, EICHENWALDE, HOLLYWOOD, KINGS_ROW,
+        NUMBANI, ILIOS, LIJANG, NEPAL, OASIS, BLACK_FOREST, CASTILLO, CHATEAU, ANTARCTICA,
+        NECROPOLIS, PETRA, DORADO, JUNKERTOWN, RIALTO, ROUTE66, GIBRALTAR]
+
 Z_CRITICAL = 1.65
 
 GAMES_PLAYED = "Games Played"
@@ -131,8 +182,11 @@ class Main(object):
         self.all_df, self.comp_df = self.build_dataframe()
 
         self.win_rate_tracker = WinRateTracker(self.comp_df)
+        self.win_rate_tracker.measure()
 
-        self.measure()
+        self.fun_tracker = FunTracker(self.all_df)
+        self.fun_tracker.measure()
+
         pass
 
     def build_reports(self):
@@ -168,22 +222,48 @@ class Main(object):
         competitive_dataframe = dataframe[is_competitive]
 
         # Filter date to last major update
+
         # 6/14/2018 8:13:02 PM
         # Dva dm up. Torb dmg down, health up. Orisa health down. Payload speed up
-        last_update = datetime.strptime("6/21/2018 12:54:00 am", "%m/%d/%Y %H:%M:%S %p")
+
+        # 6/27/2018 8:13:02 PM
+        # Torb fixed. Sym rework
+
+        # 7/2/2018 6:00:00 PM
+        # Fixed various serious bugs in stat recording and map selection.
+        last_update = datetime.strptime("7/2/2018 6:00:00 PM", "%m/%d/%Y %H:%M:%S %p")
         is_after_update = competitive_dataframe[START_TIME] > last_update
         competitive_dataframe = competitive_dataframe[is_after_update]
 
         return dataframe, competitive_dataframe
+
+
+class Tracker(abc.ABC):
+    def __init__(self, df):
+        self.df = df
+
+    def get_games_played(self, hero):
+        blue_weights = self.df[hero_team_report_element(hero, BLUE)]
+        red_weights = self.df[hero_team_report_element(hero, RED)]
+        weights = np.concatenate((blue_weights, red_weights))
+        total_play_time = sum(weights)
+        return total_play_time
+
+
+class WinRateTracker(Tracker):
+    def __init__(self, df):
+        super().__init__(df)
+
+        self.get_effective_win_value()
 
     def measure(self):
         total_hero_playtime = 0
         for team in TEAMS:
             for hero in HEROES:
                 total_hero_playtime += \
-                    self.comp_df[hero_team_report_element(hero, team)].sum()
+                    self.df[hero_team_report_element(hero, team)].sum()
         print("Total hero playtime {}".format(total_hero_playtime))
-        print("Games {}".format(len(self.comp_df)))
+        print("Games {}".format(len(self.df)))
 
         blue_winrate_AE = self.get_map_stats(ASSAULT_ESCORT)
         blue_winrate_A = self.get_map_stats(ASSAULT)
@@ -216,14 +296,51 @@ class Main(object):
         play_rates = [(hero_combined_win_rates[hero][GAMES_PLAYED], hero) for hero in HEROES]
         play_rates.sort()
 
-        self.get_win_rate_by_team_advantage()
-
         pass
+
+    def get_effective_win_value(self):
+        win_value_func = self._get_win_rate_by_team_advantage()
+
+        win_values = []
+        loss_values = []
+        for row in self.df.iterrows():
+            row = row[1]
+            win_value = win_value_func(row)
+            try:
+                win_values.append(0.5 / win_value)
+                loss_values.append(1 - 0.5 / win_value)
+            except ZeroDivisionError:
+                win_values.append(0.5)
+                loss_values.append(0.5)
+        win_values = pandas.Series(win_values)
+
+        self.df.loc[:, WIN_VALUES] = pandas.Series(win_values).astype(float).values
+        self.df.loc[:, LOSS_VALUES] = pandas.Series(loss_values).astype(float).values
+
+    def _get_win_rate_by_team_advantage(self):
+        coefs = [- 1.01742043, 1.97327284, -0.45806834]
+
+        def win_value(df_row):
+            if df_row[WINNING_TEAM] == BLUE:
+                winning_team_size_advantage = df_row[BLUE_PLAYERS] / df_row[RED_PLAYERS]
+            elif df_row[WINNING_TEAM] == RED:
+                winning_team_size_advantage = df_row[RED_PLAYERS] / df_row[BLUE_PLAYERS]
+            else:
+                assert False
+
+            win_amount = max(0, min(1,
+                                    coefs[0]
+                                    + coefs[1] * winning_team_size_advantage
+                                    + coefs[2] * winning_team_size_advantage ** 2)
+                             )
+            return win_amount
+
+        return win_value
 
     def get_map_stats(self, mode):
         map_stats = {}
 
-        filtered_dataframe = self.comp_df[self.comp_df[MODE] == mode]
+        filtered_dataframe = self.df[self.df[MODE] == mode]
         map_stats[GAMES_PLAYED] = len(filtered_dataframe)
 
         for direction in [-1, 0, 1]:
@@ -232,34 +349,34 @@ class Main(object):
         return map_stats
 
     def blue_winrate_in_mode(self, mode, direction):
-        #does NOT weight by team size advantage
-        filtered_dataframe = self.comp_df[self.comp_df[MODE] == mode]
-
+        # does NOT weight by team size advantage
+        filtered_dataframe = self.df[self.df[MODE] == mode]
         blue_wins = filtered_dataframe[WINNING_TEAM] == BLUE
-        win_values = filtered_dataframe[WIN_VALUES]
-        weighted_blue_wins = blue_wins
-        # weighted_blue_wins = weight_wins_by_advantage(blue_wins, win_values)
 
-        if direction == 0:
-            win_rate = np.average(weighted_blue_wins)
-        else:
-            win_rate = mean_confidence_interval(blue_wins, direction)[1]
+        win_rate = mean_confidence_interval(blue_wins, direction)[1]
 
         return win_rate
 
     def hero_win_rate_total(self, hero, direction):
-        blue_wins = self.comp_df[WINNING_TEAM] == BLUE
-        weighted_blue_wins = weight_wins_by_advantage(blue_wins, self.comp_df[WIN_VALUES])
-        blue_weights = self.comp_df[hero_team_report_element(hero, BLUE)]
+        blue_wins = self.df[WINNING_TEAM] == BLUE
+        weighted_blue_wins = weight_wins_by_advantage(blue_wins, self.df[WIN_VALUES])
 
-        red_wins = self.comp_df[WINNING_TEAM] == RED
-        weighted_red_wins = weight_wins_by_advantage(red_wins, self.comp_df[WIN_VALUES])
-        red_weights = self.comp_df[hero_team_report_element(hero, RED)]
+        max_0 = functools.partial(max, 0)
+        blue_weights = self.df[hero_team_report_element(hero, BLUE)] \
+                       - self.df[hero_team_report_element(hero, RED)]
+        blue_weights = blue_weights.apply(max_0)
+
+        red_wins = self.df[WINNING_TEAM] == RED
+        weighted_red_wins = weight_wins_by_advantage(red_wins, self.df[WIN_VALUES])
+        # red_weights = self.df[hero_team_report_element(hero, RED)]
+        red_weights = self.df[hero_team_report_element(hero, RED)] \
+                      - self.df[hero_team_report_element(hero, BLUE)]
+        red_weights = red_weights.apply(max_0)
 
         wins = np.concatenate((weighted_blue_wins, weighted_red_wins))
         weights = np.concatenate((blue_weights, red_weights))
 
-        if len(wins) == 0:
+        if len(wins) == 0 or sum(weights) == 0:
             return 0.5
 
         if direction == 0:
@@ -281,8 +398,8 @@ class Main(object):
         return win_rate
 
     def hero_winrate_in_mode_on_team(self, hero, mode, team, direction=-1):
-        is_correct_mode = self.comp_df[MODE] == mode
-        filtered_dataframe = self.comp_df[is_correct_mode]
+        is_correct_mode = self.df[MODE] == mode
+        filtered_dataframe = self.df[is_correct_mode]
         data = filtered_dataframe[WINNING_TEAM] == team
 
         # amount that hero was played
@@ -291,102 +408,102 @@ class Main(object):
 
         return win_rate
 
-    def get_games_played(self, hero):
-        blue_weights = self.comp_df[hero_team_report_element(hero, BLUE)]
-        red_weights = self.comp_df[hero_team_report_element(hero, RED)]
-        weights = np.concatenate((blue_weights, red_weights))
-        total_play_time = sum(weights)
-        return total_play_time
 
-
-
-class Tracker(abc.ABC):
-    def __init__(self, df):
-        self.df = df
-
-
-class WinRateTracker(Tracker):
+class FunTracker(Tracker):
     def __init__(self, df):
         super().__init__(df)
+        self.get_expected_leaves_func = self.average_leave_rate_for_game()
 
-        self.get_effective_win_value()
+    def measure(self):
+        funs = []
+        for map in MAPS:
+            fun = self.get_fun_value_of_map(map)
+            print(map, fun)
+            map.fun = fun
+            funs.append(fun)
+        min_fun = min(funs)
+        average_fun = sum(funs) / len(funs)
+        max_fun = max(funs)
 
-    def get_effective_win_value(self):
-        win_value_func = self.get_win_rate_by_team_advantage()
+        funs = [fun - average_fun for fun in funs]
 
-        win_values = []
-        loss_values = []
-        for row in self.df.iterrows():
-            row = row[1]
-            win_value = win_value_func(row)
-            win_values.append(0.5 / win_value)
-            loss_values.append(1 - 0.5 / win_value)
-        win_values = pandas.Series(win_values)
+        min_fun = min(funs)
+        average_fun = sum(funs) / len(funs)
+        max_fun = max(funs)
 
-        self.df.loc[:, WIN_VALUES] = pandas.Series(win_values).astype(float).values
-        self.df.loc[:, LOSS_VALUES] = pandas.Series(loss_values).astype(float).values
-
-    def get_win_rate_by_team_advantage(self):
-        # blue_wins = (self.comp_df[WINNING_TEAM] == BLUE).astype(float)
-        # blue_size_advantage \
-        #     = (self.comp_df[BLUE_PLAYERS] / self.comp_df[RED_PLAYERS]).astype(float)
-        #
-        # blue_slope, blue_intercept, _, _, _ \
-        #     = scipy.stats.linregress(blue_size_advantage, blue_wins)
-        #
-        # red_wins = (self.comp_df[WINNING_TEAM] == RED).astype(float)
-        # red_size_advantage \
-        #     = (self.comp_df[RED_PLAYERS] / self.comp_df[BLUE_PLAYERS]).astype(float)
-        #
-        # red_slope, red_intercept, _, _, _ \
-        #     = scipy.stats.linregress(red_size_advantage, red_wins)
-        #
-        # slope = (blue_slope + red_slope) / 2
-        # # intercept = (blue_intercept + red_intercept) / 2
-        # intercept = 0.5 - slope  # fix so that average win rate will be 0.5
-
-        blue_wins = (self.df[WINNING_TEAM] == BLUE).astype(float)
-        blue_size_advantage \
-            = (self.df[BLUE_PLAYERS] / self.df[RED_PLAYERS]).astype(float)
-
-        # plt.plot(blue_size_advantage, blue_wins, "^b")
-        #
-        # coefs = np.polyfit(blue_size_advantage, blue_wins, 2)
-        # results = []
-        # x = np.linspace(0.5, 2, 10)
-        # for x_i in x:
-        #     sum = 0
-        #     for i in range(len(coefs)):
-        #         sum += coefs[len(coefs) - i - 1] * x_i ** i
-        #     results.append(sum)
-        # plt.plot(x, results)
-        # plt.show()
-
-        # coefs = [-0.45806834,  1.97327284, - 1.01742043]
-        coefs = [- 1.01742043, 1.97327284, -0.45806834]
-
-        def win_value(df_row):
-            if df_row[WINNING_TEAM] == BLUE:
-                winning_team_size_advantage = df_row[BLUE_PLAYERS] / df_row[RED_PLAYERS]
-            elif df_row[WINNING_TEAM] == RED:
-                winning_team_size_advantage = df_row[RED_PLAYERS] / df_row[BLUE_PLAYERS]
-            else:
-                assert False
-
-            # win_amount = intercept + slope * winning_team_size_advantage
-            win_amount = max(0, min(1,
-                                    coefs[0]
-                                    + coefs[1] * winning_team_size_advantage
-                                    + coefs[2] * winning_team_size_advantage ** 2)
-                             )
-            return win_amount
-
-        return win_value
-
-
-class FunTracker(object):
-    def __init__(self):
         pass
+
+    def average_leave_rate_for_game(self):
+        # for game in games
+        average_players = list(self.df[RED_PLAYERS] + self.df[BLUE_PLAYERS])
+        average_players = [0 if math.isnan(average_player) else average_player for average_player
+                           in average_players]
+        joins = list(self.df[JOINS])
+        lengths = list(get_length_column(self.df))
+
+        leaves = list(self.df[LEAVES])
+
+        inputs = np.array([average_players, joins, lengths])
+        outputs = leaves
+
+        def training_func(inputs, constant, p1, p2, j1, j2, l1, l2):
+            players = inputs[0]
+            joins = inputs[1]
+            length = inputs[2]
+
+            # players = players.transpose()
+            # joins = joins.transpose()
+            # length = length.transpose()
+
+            player_component = players * p1 + players ** 2 * p2
+            joins_component = joins * j1 + joins ** 2 * j2
+            length_component = length * l1 + length ** 2 * l2
+            result = constant + player_component + joins_component + length_component
+            return result
+
+        initial_guess = (1, 1, 1, 1, 1, 1, 1)
+        coefs = curve_fit(training_func, inputs, outputs, initial_guess)[0]
+
+        def get_expected_leaves(df_row):
+            players = df_row[RED_PLAYERS] + df_row[BLUE_PLAYERS]
+            joins = df_row[JOINS]
+            length = get_length_column(df_row)
+
+            constant = coefs[0]
+            p1 = coefs[1]
+            p2 = coefs[2]
+
+            j1 = coefs[3]
+            j2 = coefs[4]
+
+            l1 = coefs[5]
+            l2 = coefs[6]
+
+            player_component = players * p1 + players ** 2 * p2
+            joins_component = joins * j1 + joins ** 2 * j2
+            length_component = length * l1 + length ** 2 * l2
+            expected_leaves = constant + player_component + joins_component + length_component
+
+            return expected_leaves
+
+        return get_expected_leaves
+
+    def get_fun_value_of_map(self, map):
+        is_map = self.df[MAP] == map.name
+        filtered_df = self.df[is_map]
+        differences = []
+        for i, row in filtered_df.iterrows():
+            expected_leaves = -self.get_expected_leaves_func(row)
+            actual_leaves = -row[LEAVES]  # min(-0.2, row[LEAVES])
+            difference = actual_leaves / expected_leaves
+            if math.isnan(difference):
+                continue
+            differences.append(difference)
+        try:
+            fun_value = 1 / (sum(differences) / len(differences))
+        except ZeroDivisionError:
+            fun_value = 1
+        return fun_value
 
 
 def hero_team_report_element(hero, team):
@@ -438,6 +555,8 @@ def mean_confidence_interval(data, direction=-1):
     length = len(array)
     if length > 0:
         midpoint = np.average(array)
+        if direction == 0:
+            return midpoint, midpoint
 
         variance = np.average((data - midpoint) ** 2)
         standard_error = math.sqrt(variance)
@@ -451,8 +570,21 @@ def mean_confidence_interval(data, direction=-1):
         return direction, 0
 
 
-class Report(object):
+def get_length_column(df):
+    starts = df[START_TIME]
+    ends = df[END_TIME]
+    try:
+        lengths = list(ends - starts)
+        seconds = [length.total_seconds() for length in lengths]
+        seconds = pandas.Series(seconds)
+    except TypeError:
+        length = ends - starts
+        seconds = length.total_seconds()
 
+    return seconds
+
+
+class Report(object):
     def __init__(self, text):
         self.text = text
         self._dict = {
