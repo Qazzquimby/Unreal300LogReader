@@ -210,7 +210,7 @@ class Main(object):
             report = Report(report_text)
             array = report.to_array()
             reports.append(array)
-        report_array = np.array(reports)
+            report_array = np.array(reports)
 
         column_names = [element for element in REPORT_ELEMENTS]
 
@@ -287,7 +287,7 @@ class WinRateTracker(Tracker):
             for direction in [-1, 0, 1]:
                 win_rate = self.hero_win_rate_total(hero, direction)
                 hero_combined_win_rates[hero][direction] = win_rate
-                CUTOFF = 0.52  # 0.5 is good too
+                CUTOFF = 0.51  # 0.5 is good too
                 if (direction == -1 and win_rate > 0.0 + CUTOFF) \
                         or (direction == 1 and win_rate < 1.0 - CUTOFF):
                     print("Win rate for {0}, in direction {1}, is {2} "
